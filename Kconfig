@@ -1,0 +1,32 @@
+config ZMK_BATTERY_REPORT
+    bool "Publish battery levels as custom settings"
+    depends on ZMK_BATTERY_REPORTING
+    select ZMK_CUSTOM_SETTINGS
+    help
+      Publishes each half's battery percentage where Keeb-On! Studio can read
+      it. ZMK reports a battery level over the BLE Battery Service, which is
+      only visible to a host that is connected over Bluetooth -- the app sees
+      nothing over USB, which is exactly where someone diagnosing a keyboard
+      that will not stay connected tends to be.
+
+      The levels travel as ordinary custom settings, written in temporary
+      mode: they never reach flash and never count as an unsaved change.
+
+if ZMK_BATTERY_REPORT
+
+config ZMK_BATTERY_REPORT_STUDIO_RPC
+    bool "Expose the battery levels to Studio"
+    default y
+    depends on ZMK_STUDIO
+    select ZMK_CUSTOM_SETTINGS_STUDIO_RPC
+    help
+      Registers this module as a Studio custom subsystem. There is no RPC of
+      its own, but a setting whose subsystem id matches no registered
+      subsystem is dropped from ListSettings, so without this the levels
+      exist on the keyboard and the app cannot see them.
+
+module = ZMK_BATTERY_REPORT
+module-str = zmk_battery_report
+source "subsys/logging/Kconfig.template.log_config"
+
+endif # ZMK_BATTERY_REPORT
