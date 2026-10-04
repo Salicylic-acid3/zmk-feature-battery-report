@@ -27,9 +27,14 @@
  *   same key hold one slot rather than exhausting the pool.
  *
  * That last point has a cost: these settings hold a temporary slot each, for
- * as long as the keyboard is on. CONFIG_ZMK_CUSTOM_SETTINGS_TEMP_SLOTS
- * defaults to 2, which is exactly what a split keyboard uses here, so a board
- * enabling this module should raise it.
+ * as long as the keyboard is on -- the level per half, and the USB flag.
+ * CONFIG_ZMK_CUSTOM_SETTINGS_TEMP_SLOTS defaults to 2, so a board enabling
+ * this module should raise it (the shipped boards use 4).
+ *
+ * One exception to "never touches flash": when USB power arrives, the last
+ * reading taken on battery is written once in PERSIST mode, so that a
+ * keyboard rebooted on USB still shows the cell's last known level rather
+ * than 0. One write per plug-in.
  */
 
 #include <errno.h>
@@ -43,6 +48,10 @@
 #include <keebon/zmk/battery_report.h>
 #include <zmk/event_manager.h>
 #include <zmk/events/battery_state_changed.h>
+#if IS_ENABLED(CONFIG_ZMK_USB)
+#include <zmk/events/usb_conn_state_changed.h>
+#include <zmk/usb.h>
+#endif
 
 LOG_MODULE_REGISTER(zmk_battery_report, CONFIG_ZMK_BATTERY_REPORT_LOG_LEVEL);
 
@@ -64,6 +73,18 @@ ZMK_CUSTOM_SETTING_DEFINE(battery_report_central, SUBSYS, "central",
                           ZMK_CUSTOM_SETTING_CONFIDENTIALITY_RPC_PUBLIC,
                           ZMK_CUSTOM_SETTING_PERMISSION_UNSECURE,
                           ZMK_CUSTOM_SETTING_PERMISSION_SECURE, BATTERY_CONSTRAINT);
+
+/*
+ * True while this half is powered over USB. Then "central" is not a live
+ * reading: the sensor measures the USB rail, which says nothing about the
+ * cell, so the value shown is the last one measured on battery (see
+ * battery_report_listener), and the app can say so.
+ */
+ZMK_CUSTOM_SETTING_DEFINE(battery_report_central_on_usb, SUBSYS, "central_on_usb",
+                          ZMK_CUSTOM_SETTING_VALUE_TYPE_BOOL, ZMK_CUSTOM_SETTING_VALUE_BOOL(false),
+                          ZMK_CUSTOM_SETTING_CONFIDENTIALITY_RPC_PUBLIC,
+                          ZMK_CUSTOM_SETTING_PERMISSION_UNSECURE,
+                          ZMK_CUSTOM_SETTING_PERMISSION_SECURE, ZMK_CUSTOM_SETTING_NO_CONSTRAINT);
 
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING)
 
@@ -97,12 +118,81 @@ static void publish(const char *key, uint8_t state_of_charge) {
     }
 }
 
+#if IS_ENABLED(CONFIG_ZMK_USB)
+static bool on_usb;
+static bool have_battery_reading;
+static uint8_t last_on_battery;
+
+static void publish_on_usb(bool powered) {
+    const struct zmk_custom_setting_value value = {
+        .type = ZMK_CUSTOM_SETTING_VALUE_TYPE_BOOL,
+        .bool_value = powered,
+    };
+    int ret = zmk_custom_setting_write_by_key(SUBSYS, "central_on_usb", &value,
+                                              ZMK_CUSTOM_SETTING_WRITE_MODE_TEMPORARY);
+    if (ret < 0) {
+        LOG_WRN("could not publish USB state (%d)", ret);
+    }
+}
+
+/*
+ * USB just arrived: the last reading taken on battery is written once, to
+ * flash, so that it is still the number shown after a reboot on USB (a
+ * firmware update, say) -- one write per plug-in, not one per minute. From
+ * here until USB goes away the sensor's readings are of the USB rail and are
+ * not published.
+ */
+static void remember_last_on_battery(void) {
+    if (!have_battery_reading) {
+        return;
+    }
+    const struct zmk_custom_setting_value value = {
+        .type = ZMK_CUSTOM_SETTING_VALUE_TYPE_INT32,
+        .int32_value = (int32_t)last_on_battery,
+    };
+    int ret = zmk_custom_setting_write_by_key(SUBSYS, "central", &value,
+                                              ZMK_CUSTOM_SETTING_WRITE_MODE_PERSIST);
+    if (ret < 0) {
+        LOG_WRN("could not keep the last battery reading (%d)", ret);
+    }
+}
+#endif
+
 static int battery_report_listener(const zmk_event_t *eh) {
     const struct zmk_battery_state_changed *local = as_zmk_battery_state_changed(eh);
     if (local != NULL) {
+#if IS_ENABLED(CONFIG_ZMK_USB)
+        if (zmk_usb_is_powered()) {
+            /* The USB rail, not the cell. Keep showing the last real one. */
+            return ZMK_EV_EVENT_BUBBLE;
+        }
+        have_battery_reading = true;
+        last_on_battery = local->state_of_charge;
+#endif
         publish("central", local->state_of_charge);
         return ZMK_EV_EVENT_BUBBLE;
     }
+
+#if IS_ENABLED(CONFIG_ZMK_USB)
+    if (as_zmk_custom_settings_initialized(eh) != NULL) {
+        on_usb = zmk_usb_is_powered();
+        publish_on_usb(on_usb);
+        return ZMK_EV_EVENT_BUBBLE;
+    }
+
+    const struct zmk_usb_conn_state_changed *usb = as_zmk_usb_conn_state_changed(eh);
+    if (usb != NULL) {
+        const bool powered = zmk_usb_is_powered();
+        if (powered != on_usb) {
+            on_usb = powered;
+            publish_on_usb(powered);
+            if (powered) {
+                remember_last_on_battery();
+            }
+        }
+        return ZMK_EV_EVENT_BUBBLE;
+    }
+#endif
 
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING)
     const struct zmk_peripheral_battery_state_changed *peripheral =
@@ -129,6 +219,14 @@ static int battery_report_listener(const zmk_event_t *eh) {
 
 ZMK_LISTENER(zmk_battery_report, battery_report_listener);
 ZMK_SUBSCRIPTION(zmk_battery_report, zmk_battery_state_changed);
+#if IS_ENABLED(CONFIG_ZMK_USB)
+ZMK_SUBSCRIPTION(zmk_battery_report, zmk_usb_conn_state_changed);
+
+/* The USB state at boot, once the settings registry is ready to take a
+ * write: a keyboard that is plugged in when it starts would otherwise look
+ * like it was on battery until USB changed state. */
+ZMK_SUBSCRIPTION(zmk_battery_report, zmk_custom_settings_initialized);
+#endif
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING)
 ZMK_SUBSCRIPTION(zmk_battery_report, zmk_peripheral_battery_state_changed);
 #endif
