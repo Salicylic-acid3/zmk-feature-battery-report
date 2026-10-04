@@ -27,9 +27,10 @@
  *   same key hold one slot rather than exhausting the pool.
  *
  * That last point has a cost: these settings hold a temporary slot each, for
- * as long as the keyboard is on -- the level per half, and the USB flag.
- * CONFIG_ZMK_CUSTOM_SETTINGS_TEMP_SLOTS defaults to 2, so a board enabling
- * this module should raise it (the shipped boards use 4).
+ * as long as the keyboard is on -- the level and the voltage of this half,
+ * the USB flag, and a level per peripheral. CONFIG_ZMK_CUSTOM_SETTINGS_TEMP_SLOTS
+ * defaults to 2, so a board enabling this module must raise it (the shipped
+ * boards use 4; a split that fetches its peripheral's level needs 5).
  *
  * One exception to "never touches flash": when USB power arrives, the last
  * reading taken on battery is written once in PERSIST mode, so that a
@@ -40,6 +41,9 @@
 #include <errno.h>
 #include <stdio.h>
 
+#include <zephyr/device.h>
+#include <zephyr/devicetree.h>
+#include <zephyr/drivers/sensor.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/util.h>
@@ -75,6 +79,41 @@ ZMK_CUSTOM_SETTING_DEFINE(battery_report_central, SUBSYS, "central",
                           ZMK_CUSTOM_SETTING_PERMISSION_SECURE, BATTERY_CONSTRAINT);
 
 /*
+ * The same reading in millivolts. A percentage from a linear clamp between
+ * two configured voltages says less than the voltage itself once the cell
+ * is on its way down -- a coin cell dies at a voltage, and the owner learns
+ * which one -- so the app shows this and keeps the percentage as a bar.
+ * Read from the battery sensor's voltage channel right after ZMK fetched it
+ * for the percentage, so the two are the same sample. 0 when the sensor
+ * does not offer the channel.
+ */
+ZMK_CUSTOM_SETTING_DEFINE(battery_report_central_mv, SUBSYS, "central_mv",
+                          ZMK_CUSTOM_SETTING_VALUE_TYPE_INT32, ZMK_CUSTOM_SETTING_VALUE_INT32(0),
+                          ZMK_CUSTOM_SETTING_CONFIDENTIALITY_RPC_PUBLIC,
+                          ZMK_CUSTOM_SETTING_PERMISSION_UNSECURE,
+                          ZMK_CUSTOM_SETTING_PERMISSION_SECURE,
+                          ZMK_CUSTOM_SETTING_RANGE_INT32(0, 65535));
+
+/*
+ * The voltage below which this firmware turns the keyboard off to protect
+ * the cells (the non-LiPo module's CONFIG_ZMK_NON_LIPO_LOW_MV), as a
+ * constant for the app to put next to the reading. 0 when the firmware has
+ * no such cut-off.
+ */
+#ifdef CONFIG_ZMK_NON_LIPO_LOW_MV
+#define BATTERY_REPORT_CUTOFF_MV CONFIG_ZMK_NON_LIPO_LOW_MV
+#else
+#define BATTERY_REPORT_CUTOFF_MV 0
+#endif
+ZMK_CUSTOM_SETTING_DEFINE(battery_report_cutoff_mv, SUBSYS, "cutoff_mv",
+                          ZMK_CUSTOM_SETTING_VALUE_TYPE_INT32,
+                          ZMK_CUSTOM_SETTING_VALUE_INT32(BATTERY_REPORT_CUTOFF_MV),
+                          ZMK_CUSTOM_SETTING_CONFIDENTIALITY_RPC_PUBLIC,
+                          ZMK_CUSTOM_SETTING_PERMISSION_UNSECURE,
+                          ZMK_CUSTOM_SETTING_PERMISSION_SECURE,
+                          ZMK_CUSTOM_SETTING_RANGE_INT32(0, 65535));
+
+/*
  * True while this half is powered over USB. Then "central" is not a live
  * reading: the sensor measures the USB rail, which says nothing about the
  * cell, so the value shown is the last one measured on battery (see
@@ -102,10 +141,10 @@ LISTIFY(PERIPHERAL_COUNT, PERIPHERAL_SETTING_DEFINE, (), _)
 
 #endif /* CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING */
 
-static void publish(const char *key, uint8_t state_of_charge) {
+static void publish(const char *key, int32_t number) {
     const struct zmk_custom_setting_value value = {
         .type = ZMK_CUSTOM_SETTING_VALUE_TYPE_INT32,
-        .int32_value = (int32_t)state_of_charge,
+        .int32_value = number,
     };
 
     int ret = zmk_custom_setting_write_by_key(SUBSYS, key, &value,
@@ -118,10 +157,29 @@ static void publish(const char *key, uint8_t state_of_charge) {
     }
 }
 
+/* The local sensor's last voltage, in millivolts, or 0 without one. ZMK's
+ * battery code has just fetched the sensor when the event arrives, so this
+ * is the sample the percentage came from. */
+static int32_t local_millivolts(void) {
+#if DT_HAS_CHOSEN(zmk_battery)
+    const struct device *const battery = DEVICE_DT_GET(DT_CHOSEN(zmk_battery));
+    struct sensor_value v;
+
+    if (!device_is_ready(battery) ||
+        sensor_channel_get(battery, SENSOR_CHAN_GAUGE_VOLTAGE, &v) != 0) {
+        return 0;
+    }
+    return v.val1 * 1000 + v.val2 / 1000;
+#else
+    return 0;
+#endif
+}
+
 #if IS_ENABLED(CONFIG_ZMK_USB)
 static bool on_usb;
 static bool have_battery_reading;
 static uint8_t last_on_battery;
+static int32_t last_on_battery_mv;
 
 static void publish_on_usb(bool powered) {
     const struct zmk_custom_setting_value value = {
@@ -155,6 +213,15 @@ static void remember_last_on_battery(void) {
     if (ret < 0) {
         LOG_WRN("could not keep the last battery reading (%d)", ret);
     }
+    const struct zmk_custom_setting_value mv = {
+        .type = ZMK_CUSTOM_SETTING_VALUE_TYPE_INT32,
+        .int32_value = last_on_battery_mv,
+    };
+    ret = zmk_custom_setting_write_by_key(SUBSYS, "central_mv", &mv,
+                                          ZMK_CUSTOM_SETTING_WRITE_MODE_PERSIST);
+    if (ret < 0) {
+        LOG_WRN("could not keep the last battery voltage (%d)", ret);
+    }
 }
 #endif
 
@@ -168,8 +235,12 @@ static int battery_report_listener(const zmk_event_t *eh) {
         }
         have_battery_reading = true;
         last_on_battery = local->state_of_charge;
+        last_on_battery_mv = local_millivolts();
+        publish("central_mv", last_on_battery_mv);
+#else
+        publish("central_mv", local_millivolts());
 #endif
-        publish("central", local->state_of_charge);
+        publish("central", (int32_t)local->state_of_charge);
         return ZMK_EV_EVENT_BUBBLE;
     }
 
@@ -210,7 +281,7 @@ static int battery_report_listener(const zmk_event_t *eh) {
             return ZMK_EV_EVENT_BUBBLE;
         }
 
-        publish(key, peripheral->state_of_charge);
+        publish(key, (int32_t)peripheral->state_of_charge);
     }
 #endif
 
